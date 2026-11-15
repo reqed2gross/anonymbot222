@@ -10,6 +10,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, ReplyParameters,
     InputMediaPhoto, InputMediaVideo, InputMediaAnimation,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, CallbackQuery
 )
 from aiogram.exceptions import TelegramAPIError
 from aiohttp import web
@@ -40,7 +42,14 @@ _last_warn: dict[int, float] = {}
 
 # Словарь для режима диалога: {id_админа: id_анонима}
 active_chats: dict[int, int] = {}
-
+# Нижнее меню для админа
+admin_menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="🛑 Выйти из диалога")]
+    ],
+    resize_keyboard=True
+)
 def is_admin(message: Message) -> bool:
     return bool(message.from_user) and message.from_user.id == config.ADMIN_ID
 
@@ -74,52 +83,26 @@ async def send_welcome_if_needed(message: Message):
     await db.mark_seen_welcome(user_id)
 
 
-async def deliver_single(message: Message):
-    admin_id = config.ADMIN_ID
-    user_id = message.from_user.id
-    try:
-        sent = await bot.copy_message(
-            chat_id=admin_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
-    except TelegramAPIError as e:
-        log.error(f"delivery to admin failed: {e}")
-        return
-
-    await db.save_message_map(admin_id, sent.message_id, user_id)
-    user = await db.get_or_create_user(user_id)
-
+    # Создаем кнопки
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{user['id']}"),
+            InlineKeyboardButton(text="🚫 Забанить", callback_data=f"block_{user['id']}")
+        ]
+    ])
+    
+    # Отправляем с кнопками
     try:
         await bot.send_message(
             admin_id,
-            f"<i>Аноним #{user['id']} · reply, чтобы ответить</i>",
+            f"<i>Аноним #{user['id']}</i>",
             reply_parameters=ReplyParameters(
                 message_id=sent.message_id, allow_sending_without_reply=True
             ),
+            reply_markup=kb
         )
     except TelegramAPIError:
         pass
-
-    _, autoreply, *_ = await get_texts()
-    try:
-        await bot.send_message(user_id, autoreply)
-    except TelegramAPIError as e:
-        log.error(f"autoreply failed: {e}")
-
-
-async def _flush_album(key: tuple[int, str]):
-    await asyncio.sleep(1.0)
-    messages = _album_buffer.pop(key, [])
-    _album_tasks.pop(key, None)
-    if not messages:
-        return
-
-    user_id = key[0]
-    admin_id = config.ADMIN_ID
-
-    photos, videos, anims = [], [], []
-    non_group = False
 
     for msg in messages:
         if msg.photo:
@@ -190,12 +173,14 @@ async def cmd_start(message: Message):
             "/stats — статистика\n"
             "/block — reply на сообщение анонима → бан\n"
             "/unblock &lt;номер&gt; — разбан (номер — «Аноним #N»)\n"
+            "/chat &lt;номер&gt; — режим диалога\n"
+            "/stop — выйти из диалога\n"
             "/show_settings — текущие тексты и лимит\n"
             "/set_welcome — reply на сообщение → новое приветствие\n"
             "/set_autoreply — reply → новый автоответ\n"
             "/set_antispam_text — reply → текст антиспама\n"
-            "/set_antispam_limit &lt;n&gt; &lt;сек&gt; — лимит и окно\n"
-            "/help — помощь"
+            "/set_antispam_limit &lt;n&gt; &lt;сек&gt; — лимит и окно",
+            reply_markup=admin_menu  # <--- ДОБАВИЛИ ЭТО
         )
         return
     await send_welcome_if_needed(message)
@@ -495,6 +480,57 @@ async def user_message(message: Message):
 
 
 # ================== Health / Webhook / Main ==================
+# ================== Обработка кнопок ==================
+
+@dp.callback_query(F.data.startswith("reply_"))
+async def cb_reply(callback: CallbackQuery):
+    internal_id = int(callback.data.split("_")[1])
+    user = await db.get_user_by_internal_id(internal_id)
+    
+    if not user:
+        await callback.answer("Аноним не найден", show_alert=True)
+        return
+        
+    active_chats[callback.from_user.id] = user["tg_id"]
+    
+    await callback.message.edit_text(
+        f"<i>Аноним #{internal_id} (Режим ответа включен)</i>",
+        reply_markup=None
+    )
+    await callback.message.answer("Режим ответа включен. Пишите текст или прикрепите медиа. Для выхода — /stop или кнопка «Выйти из диалога».")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("block_"))
+async def cb_block(callback: CallbackQuery):
+    internal_id = int(callback.data.split("_")[1])
+    user = await db.get_user_by_internal_id(internal_id)
+    
+    if user:
+        await db.set_blocked(user["tg_id"], True)
+        await callback.message.edit_text(
+            f"<i>Аноним #{internal_id} [ЗАБЛОКИРОВАН]</i>",
+            reply_markup=None
+        )
+        await callback.answer("Аноним заблокирован")
+        try:
+            await bot.send_message(user["tg_id"], "Вы заблокированы.")
+        except TelegramAPIError:
+            pass
+    else:
+        await callback.answer("Аноним не найден", show_alert=True)
+
+# Обработка кнопок нижнего меню
+@dp.message(F.text == "📊 Статистика")
+async def btn_stats(message: Message):
+    await cmd_stats(message)
+
+@dp.message(F.text == "⚙️ Настройки")
+async def btn_settings(message: Message):
+    await cmd_show_settings(message)
+
+@dp.message(F.text == "🛑 Выйти из диалога")
+async def btn_stop(message: Message):
+    await cmd_stop(message)
 
 async def health(request):
     return web.Response(text="OK")
