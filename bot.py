@@ -45,12 +45,13 @@ _album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _last_warn: dict[int, float] = {}
 active_chats: dict[int, int] = {}  # {admin_id: tg_id}
 
-# Машина состояний для изменения текстов
+# Машина состояний
 class AdminStates(StatesGroup):
     waiting_for_welcome = State()
     waiting_for_autoreply = State()
     waiting_for_antispam_text = State()
     waiting_for_antispam_limit = State()
+    waiting_for_unblock_id = State() # <-- НОВОЕ: Ожидание ID для разбана
 
 def is_admin(message: Message) -> bool:
     return bool(message.from_user) and message.from_user.id == config.ADMIN_ID
@@ -58,10 +59,11 @@ def is_admin(message: Message) -> bool:
 # ================== Клавиатуры ==================
 
 def get_main_menu():
+    # Обновленное нижнее меню (добавлен Разбан)
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройки")],
-            [KeyboardButton(text="💬 Выбрать чат")]
+            [KeyboardButton(text="💬 Выбрать чат"), KeyboardButton(text="🔓 Разбанить")]
         ],
         resize_keyboard=True
     )
@@ -92,7 +94,6 @@ async def get_chats_menu(page: int):
     total_pages = math.ceil(total_users / limit)
 
     kb = []
-    # Кнопки с анонимами (по 2 в ряд)
     row = []
     for u in users:
         status = "🚫" if u["is_blocked"] else "✅"
@@ -103,7 +104,6 @@ async def get_chats_menu(page: int):
     if row:
         kb.append(row)
 
-    # Навигация (Назад / Вперед)
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"page_{page-1}"))
@@ -112,9 +112,19 @@ async def get_chats_menu(page: int):
     if nav_row:
         kb.append(nav_row)
         
-    # Кнопка в меню
     kb.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
+# Карточка конкретного анонима
+def get_user_action_menu(internal_id: int, is_blocked: bool):
+    kb = []
+    if is_blocked:
+        kb.append([InlineKeyboardButton(text="🔓 Разбанить", callback_data=f"unblock_{internal_id}")])
+    else:
+        kb.append([InlineKeyboardButton(text="💬 Войти в диалог", callback_data=f"enter_chat_{internal_id}")])
+        kb.append([InlineKeyboardButton(text="🚫 Забанить", callback_data=f"block_{internal_id}")])
+    
+    kb.append([InlineKeyboardButton(text="🔙 Назад к списку", callback_data="back_to_chats")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # ================== Отправка сообщений ==================
@@ -141,8 +151,7 @@ async def send_welcome_if_needed(message: Message):
         text = welcome.replace("{first_name}", safe_name)
     try:
         await message.answer(text)
-    except TelegramAPIError as e:
-        log.error(f"welcome send failed: {e}")
+    except TelegramAPIError:
         return
     await db.mark_seen_welcome(user_id)
 
@@ -150,13 +159,8 @@ async def deliver_single(message: Message):
     admin_id = config.ADMIN_ID
     user_id = message.from_user.id
     try:
-        sent = await bot.copy_message(
-            chat_id=admin_id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
-    except TelegramAPIError as e:
-        log.error(f"delivery to admin failed: {e}")
+        sent = await bot.copy_message(chat_id=admin_id, from_chat_id=message.chat.id, message_id=message.message_id)
+    except TelegramAPIError:
         return
 
     await db.save_message_map(admin_id, sent.message_id, user_id)
@@ -171,26 +175,21 @@ async def deliver_single(message: Message):
 
     try:
         await bot.send_message(
-            admin_id,
-            f"<i>Аноним #{user['id']}</i>",
+            admin_id, f"<i>Аноним #{user['id']}</i>",
             reply_parameters=ReplyParameters(message_id=sent.message_id, allow_sending_without_reply=True),
             reply_markup=kb
         )
-    except TelegramAPIError:
-        pass
+    except TelegramAPIError: pass
 
     _, autoreply, *_ = await get_texts()
-    try:
-        await bot.send_message(user_id, autoreply)
-    except TelegramAPIError as e:
-        log.error(f"autoreply failed: {e}")
+    try: await bot.send_message(user_id, autoreply)
+    except TelegramAPIError: pass
 
 async def _flush_album(key: tuple[int, str]):
     await asyncio.sleep(1.0)
     messages = _album_buffer.pop(key, [])
     _album_tasks.pop(key, None)
-    if not messages:
-        return
+    if not messages: return
 
     user_id = key[0]
     admin_id = config.ADMIN_ID
@@ -225,20 +224,14 @@ async def _flush_album(key: tuple[int, str]):
 
     user = await db.get_or_create_user(user_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{user['id']}"),
-            InlineKeyboardButton(text="🚫 Забанить", callback_data=f"block_{user['id']}")
-        ]
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_{user['id']}"), InlineKeyboardButton(text="🚫 Забанить", callback_data=f"block_{user['id']}")]
     ])
-    try:
-        await bot.send_message(admin_id, f"<i>Альбом от Анонима #{user['id']}</i>", reply_markup=kb)
+    try: await bot.send_message(admin_id, f"<i>Альбом от Анонима #{user['id']}</i>", reply_markup=kb)
     except TelegramAPIError: pass
 
     _, autoreply, *_ = await get_texts()
-    try:
-        await bot.send_message(user_id, autoreply)
-    except TelegramAPIError as e:
-        log.error(f"autoreply failed: {e}")
+    try: await bot.send_message(user_id, autoreply)
+    except TelegramAPIError: pass
 
 # ================== Админ: Обработка кнопок ==================
 
@@ -289,6 +282,13 @@ async def btn_chats(message: Message):
     if not is_admin(message): return
     await message.answer("Выберите анонима для диалога:", reply_markup=await get_chats_menu(0))
 
+# Нижняя кнопка "Разбанить"
+@dp.message(F.text == "🔓 Разбанить")
+async def btn_unblock_prompt(message: Message, state: FSMContext):
+    if not is_admin(message): return
+    await state.set_state(AdminStates.waiting_for_unblock_id)
+    await message.answer("Введите номер анонима, которого нужно разбанить (например, <code>1</code>):")
+
 # ================== Админ: Callback (Инлайн-кнопки) ==================
 
 @dp.callback_query()
@@ -299,10 +299,14 @@ async def handle_callbacks(callback: CallbackQuery, state: FSMContext):
 
     data = callback.data
 
-    # Пагинация чатов
     if data.startswith("page_"):
         page = int(data.split("_")[1])
         await callback.message.edit_reply_markup(reply_markup=await get_chats_menu(page))
+        await callback.answer()
+        return
+
+    if data == "back_to_chats":
+        await callback.message.edit_text("Выберите анонима для диалога:", reply_markup=await get_chats_menu(0))
         await callback.answer()
         return
     
@@ -313,20 +317,30 @@ async def handle_callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Выбор чата из списка
+    # Показ карточки анонима
     if data.startswith("select_"):
         internal_id = int(data.split("_")[1])
         user = await db.get_user_by_internal_id(internal_id)
         if not user:
             await callback.answer("Аноним не найден", show_alert=True)
             return
-        active_chats[callback.from_user.id] = user["tg_id"]
-        await callback.message.delete()
-        await callback.message.answer(
-            f"💬 <b>Диалог с Анонимом #{internal_id}</b>\n\nВсе ваши сообщения будут уходить ему. Для выхода нажмите кнопку ниже.",
-            reply_markup=get_dialog_menu()
+        status = "в бане 🚫" if user["is_blocked"] else "активен ✅"
+        await callback.message.edit_text(
+            f"Аноним #{internal_id} (Статус: {status})\nЧто будем делать?",
+            reply_markup=get_user_action_menu(internal_id, user["is_blocked"])
         )
         await callback.answer()
+        return
+
+    # Вход в диалог из карточки
+    if data.startswith("enter_chat_"):
+        internal_id = int(data.split("_")[1])
+        user = await db.get_user_by_internal_id(internal_id)
+        if user:
+            active_chats[callback.from_user.id] = user["tg_id"]
+            await callback.message.delete()
+            await callback.message.answer(f"💬 <b>Диалог с Анонимом #{internal_id}</b>", reply_markup=get_dialog_menu())
+            await callback.answer()
         return
 
     # Кнопки под сообщениями
@@ -344,13 +358,23 @@ async def handle_callbacks(callback: CallbackQuery, state: FSMContext):
         user = await db.get_user_by_internal_id(internal_id)
         if user:
             await db.set_blocked(user["tg_id"], True)
-            await callback.message.edit_text(f"<i>Аноним #{internal_id} [ЗАБЛОКИРОВАН]</i>")
+            await callback.message.edit_text(f"<i>Аноним #{internal_id} [ЗАБЛОКИРОВАН]</i>", reply_markup=None)
             await callback.answer("Забанен")
             try: await bot.send_message(user["tg_id"], "Вы заблокированы.")
             except: pass
         return
 
-    # Настройки
+    if data.startswith("unblock_"):
+        internal_id = int(data.split("_")[1])
+        user = await db.get_user_by_internal_id(internal_id)
+        if user:
+            await db.set_blocked(user["tg_id"], False)
+            await callback.message.edit_text(f"<i>Аноним #{internal_id} [РАЗБЛОКИРОВАН]</i>", reply_markup=None)
+            await callback.answer("Разбанен")
+            try: await bot.send_message(user["tg_id"], "Вы разблокированы. Можно снова писать.")
+            except: pass
+        return
+
     if data == "show_settings":
         welcome, autoreply, antispam_text, limit, window = await get_texts()
         await callback.message.answer(
@@ -363,12 +387,11 @@ async def handle_callbacks(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    # Запуск ожидания ввода
     states_map = {
-        "set_welcome": (AdminStates.waiting_for_welcome, "Отправьте новый текст <b>приветствия</b> одним сообщением:"),
+        "set_welcome": (AdminStates.waiting_for_welcome, "Отправьте новый текст <b>приветствия</b>:"),
         "set_autoreply": (AdminStates.waiting_for_autoreply, "Отправьте новый текст <b>автоответа</b>:"),
         "set_antispam_text": (AdminStates.waiting_for_antispam_text, "Отправьте новый текст <b>антиспама</b>:"),
-        "set_antispam_limit": (AdminStates.waiting_for_antispam_limit, "Отправьте новый лимит в формате: <code>5 30</code> (5 сообщений за 30 секунд):")
+        "set_antispam_limit": (AdminStates.waiting_for_antispam_limit, "Отправьте новый лимит в формате: <code>5 30</code>:")
     }
 
     if data in states_map:
@@ -411,24 +434,39 @@ async def process_antispam_limit(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Ошибка! Отправьте два числа через пробел (например, <code>5 30</code>).")
 
-# ================== Админ: Ответы и тексты ==================
+# Обработка ввода ID для разбана через нижнюю кнопку
+@dp.message(AdminStates.waiting_for_unblock_id)
+async def process_unblock_id(message: Message, state: FSMContext):
+    if message.text and message.text.isdigit():
+        internal_id = int(message.text)
+        user = await db.get_user_by_internal_id(internal_id)
+        if user:
+            await db.set_blocked(user["tg_id"], False)
+            await message.answer(f"✅ Аноним #{internal_id} разблокирован.", reply_markup=get_main_menu())
+            try: await bot.send_message(user["tg_id"], "Вы разблокированы. Можно снова писать.")
+            except: pass
+        else:
+            await message.answer(f"❌ Аноним #{internal_id} не найден.", reply_markup=get_main_menu())
+        await state.clear()
+    else:
+        await message.answer("❌ Ошибка! Введите только число (например, 1).")
+
+# ================== Админ: Ответы ==================
 
 @dp.message(F.from_user.id == config.ADMIN_ID)
 async def admin_reply(message: Message):
     if message.text and message.text.startswith("/"):
         return
     
-    # 1. Проверяем активный диалог
     target_tg_id = active_chats.get(message.from_user.id)
     
-    # 2. Если нет активного, проверяем Reply
     if not target_tg_id and message.reply_to_message:
         target_tg_id = await db.lookup_message_map(message.chat.id, message.reply_to_message.message_id)
         if not target_tg_id:
-            await message.answer("Не нашёл, кому отвечать. Выберите чат через меню или сделайте Reply.")
+            await message.answer("Не нашёл, кому отвечать. Используйте кнопки или Reply.")
             return
     elif not target_tg_id:
-        return # Если просто пишет в пустоту
+        return
 
     user = await db.get_user_by_tg(target_tg_id)
     if user and user["is_blocked"]:
