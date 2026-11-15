@@ -38,6 +38,8 @@ _album_buffer: dict[tuple[int, str], list[Message]] = {}
 _album_tasks: dict[tuple[int, str], asyncio.Task] = {}
 _last_warn: dict[int, float] = {}
 
+# Словарь для режима диалога: {id_админа: id_анонима}
+active_chats: dict[int, int] = {}
 
 def is_admin(message: Message) -> bool:
     return bool(message.from_user) and message.from_user.id == config.ADMIN_ID
@@ -248,7 +250,42 @@ async def cmd_block(message: Message):
         await bot.send_message(tg_id, "Вы заблокированы.")
     except TelegramAPIError:
         pass
+@dp.message(Command("chat"))
+async def cmd_chat(message: Message):
+    if not is_admin(message):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: /chat <номер>\nНапример: /chat 1")
+        return
+    
+    internal_id = int(parts[1])
+    user = await db.get_user_by_internal_id(internal_id)
+    
+    if not user:
+        await message.answer(f"Аноним #{internal_id} не найден.")
+        return
+    if user["is_blocked"]:
+        await message.answer(f"Аноним #{internal_id} в бане. Сначала разбаньте его через /unblock.")
+        return
 
+    active_chats[message.from_user.id] = user["tg_id"]
+    await message.answer(
+        f"<b>Режим диалога с Анонимом #{internal_id} включен.</b>\n\n"
+        "Все ваши сообщения (текст, фото, стикеры) будут пересылаться ему.\n"
+        "Чтобы выйти из диалога, напишите /stop"
+    )
+
+
+@dp.message(Command("stop"))
+async def cmd_stop(message: Message):
+    if not is_admin(message):
+        return
+    if message.from_user.id in active_chats:
+        del active_chats[message.from_user.id]
+        await message.answer("Режим диалога выключен. Теперь ваши сообщения не пересылаются анонимам.")
+    else:
+        await message.answer("Вы и так не в режиме диалога.")
 
 @dp.message(Command("unblock"))
 async def cmd_unblock(message: Message):
@@ -358,25 +395,38 @@ async def cmd_set_antispam_limit(message: Message):
 @dp.message(F.from_user.id == config.ADMIN_ID)
 async def admin_reply(message: Message):
     if message.text and message.text.startswith("/"):
-        return  # команды выше уже отработали
-    if not message.reply_to_message:
-        return  # своё сообщение — игнор
-    tg_id = await db.lookup_message_map(
-        message.chat.id, message.reply_to_message.message_id
-    )
-    if not tg_id:
-        await message.answer(
-            "Не нашёл, кому отвечать (возможно, это сообщение бота "
-            "или старая запись)."
+        return  # Пропускаем команды (например, /stats)
+
+    target_tg_id = None
+
+    # 1. Проверяем, включен ли режим диалога (/chat)
+    if message.from_user.id in active_chats:
+        target_tg_id = active_chats[message.from_user.id]
+    
+    # 2. Если режима нет, но админ сделал Reply
+    elif message.reply_to_message:
+        target_tg_id = await db.lookup_message_map(
+            message.chat.id, message.reply_to_message.message_id
         )
-        return
-    user = await db.get_user_by_tg(tg_id)
+        if not target_tg_id:
+            await message.answer(
+                "Не нашёл, кому отвечать (возможно, это сообщение бота). "
+                "Используйте /chat <номер> или Reply на сообщение анонима."
+            )
+            return
+    else:
+        return # Админ просто пишет в пустоту, ничего не делаем
+
+    # Проверяем, не забанен ли аноним
+    user = await db.get_user_by_tg(target_tg_id)
     if user and user["is_blocked"]:
         await message.answer("Этот аноним заблокирован. Сначала /unblock.")
         return
+
+    # Отправляем сообщение анониму
     try:
         await bot.copy_message(
-            chat_id=tg_id,
+            chat_id=target_tg_id,
             from_chat_id=message.chat.id,
             message_id=message.message_id,
         )
@@ -384,8 +434,8 @@ async def admin_reply(message: Message):
         log.error(f"admin reply failed: {e}")
         await message.answer(f"Не удалось доставить: {e}")
         return
+    
     await message.answer("Доставлено анониму.")
-
 
 # ================== Сообщения от пользователей ==================
 
