@@ -140,6 +140,17 @@ async def get_stats() -> tuple[int, int, int]:
         total_messages = await conn.fetchval("SELECT COUNT(*) FROM message_map")
     return total_users, blocked_users, total_messages
 
+async def get_users_paginated(offset: int, limit: int) -> list[dict]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, is_blocked FROM users ORDER BY id LIMIT $1 OFFSET $2",
+            limit, offset
+        )
+    return [dict(r) for r in rows]
+
+async def get_users_count() -> int:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM users")
 
 async def close_db():
     global pool
